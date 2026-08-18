@@ -16,8 +16,16 @@
 
 #include "decoderXQARunner.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <limits>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <string.h>
+#include <type_traits>
+#include <vector>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -222,6 +230,90 @@ void DecoderXQARunner::runDispatchKVCacheBuffer(
 
 namespace
 {
+using TemporalXqaFn = int (*)(void*, void*, void*, void*, int32_t const*, uint32_t const*, uint32_t, uint32_t, float,
+    float const*, uint32_t*, uint32_t*, uint32_t, float, uint32_t, uint32_t*, void*, void*);
+using TemporalSetPolicyFn = int (*)(uint32_t, uint32_t);
+
+bool useTemporalQkSkip()
+{
+    static bool const enabled = []
+    {
+        char const* value = std::getenv("TLLM_TEMPORAL_QK_SKIP");
+        return value != nullptr && std::string(value) != "0";
+    }();
+    return enabled;
+}
+
+uint32_t getTemporalRefreshInterval()
+{
+    static uint32_t const value = []
+    {
+        char const* text = std::getenv("TLLM_TEMPORAL_REFRESH");
+        return text != nullptr ? static_cast<uint32_t>(std::stoul(text)) : 4U;
+    }();
+    return value;
+}
+
+uint32_t getTemporalK()
+{
+    static uint32_t const value = []
+    {
+        char const* text = std::getenv("TLLM_TEMPORAL_K");
+        return text != nullptr ? static_cast<uint32_t>(std::stoul(text)) : 2U;
+    }();
+    return value;
+}
+
+TemporalXqaFn getTemporalXqaFn()
+{
+    static TemporalXqaFn const function = []
+    {
+        char const* path = std::getenv("TLLM_TEMPORAL_XQA_LIBRARY");
+        TLLM_CHECK_WITH_INFO(path != nullptr,
+            "TLLM_TEMPORAL_XQA_LIBRARY must point to libblasst_xqa_temporal_page64.so");
+        void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        TLLM_CHECK_WITH_INFO(handle != nullptr, "failed to load temporal XQA library: %s", dlerror());
+
+        void* launchSymbol = dlsym(handle, "blasst_xqa_bf16_temporal");
+        TLLM_CHECK_WITH_INFO(launchSymbol != nullptr, "missing blasst_xqa_bf16_temporal: %s", dlerror());
+        void* policySymbol = dlsym(handle, "blasst_temporal_set_policy");
+        TLLM_CHECK_WITH_INFO(policySymbol != nullptr, "missing blasst_temporal_set_policy: %s", dlerror());
+
+        auto const setPolicy = reinterpret_cast<TemporalSetPolicyFn>(policySymbol);
+        int const status = setPolicy(getTemporalK(), getTemporalRefreshInterval());
+        TLLM_CHECK_WITH_INFO(status == 0, "invalid temporal policy: k=%u refresh=%u", getTemporalK(),
+            getTemporalRefreshInterval());
+        return reinterpret_cast<TemporalXqaFn>(launchSymbol);
+    }();
+    return function;
+}
+
+float getTemporalEpsilon(uint32_t layerIdx)
+{
+    static std::vector<float> const values = []
+    {
+        std::vector<float> parsed;
+        char const* text = std::getenv("TLLM_TEMPORAL_EPSILONS");
+        if (text == nullptr)
+        {
+            return parsed;
+        }
+        std::stringstream stream(text);
+        std::string item;
+        while (std::getline(stream, item, ','))
+        {
+            parsed.push_back(std::stof(item));
+        }
+        return parsed;
+    }();
+    if (layerIdx < values.size())
+    {
+        return values[layerIdx];
+    }
+    char const* fallback = std::getenv("TLLM_TEMPORAL_EPSILON");
+    return fallback != nullptr ? std::stof(fallback) : std::numeric_limits<float>::max();
+}
+
 struct SpecDecParams
 {
     uint32_t qSeqLen;
@@ -255,7 +347,8 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
     //  performs SDPA.
     //    In this case, xqaQInputPtr (see below) serves as the scratch space to store intermediate RoPE output.
 
-    bool const applyRoPEInXqaKernel = jit::appliesRoPEInXqaKernel(xqaParams, isGMMAKernel);
+    bool const applyRoPEInXqaKernel
+        = jit::appliesRoPEInXqaKernel(xqaParams, isGMMAKernel) && !useTemporalQkSkip();
 
     int numQHeads = xqaParams.num_q_heads;
     int numKVHeads = xqaParams.num_kv_heads;
@@ -477,6 +570,45 @@ void DecoderXQARunner::runImpl(XQAParams const& xqaParams, KVCacheBuffer const& 
     }
     else
     {
+        if (useTemporalQkSkip())
+        {
+            if constexpr (std::is_same_v<T, __nv_bfloat16> && std::is_same_v<KVCacheBuffer, KVBlockArray>)
+            {
+                TLLM_CHECK_WITH_INFO(isGMMAKernel && isSkipSoftmax && !isSpecDec,
+                    "temporal QK skip requires Hopper skip-softmax GMMA generation");
+                TLLM_CHECK_WITH_INFO(!isFp8Out && xqaParams.kv_cache_data_type == DATA_TYPE_BF16
+                        && xqaParams.generation_input_length == 1 && xqaParams.head_size == 128 && numQHeadsOverKV == 4
+                        && xqaParams.tokens_per_block == 64 && xqaParams.batch_size == 1 && xqaParams.beam_width == 1,
+                    "temporal QK skip supports one-token BF16 d128 GQA4 page64 batch1 beam1 decode only");
+                TLLM_CHECK_WITH_INFO(kvCacheBuffer.mSecondaryPoolPtr == nullptr,
+                    "temporal QK skip currently requires a single KV pool");
+
+                uint32_t const maxSequenceLength = kvCacheBuffer.mMaxBlocksPerSeq * kvCacheBuffer.mTokensPerBlock;
+                uint32_t* skippedBlocks = nullptr;
+                uint32_t* totalBlocks = nullptr;
+#if defined(SKIP_SOFTMAX_STAT)
+                skippedBlocks = xqaParams.skip_softmax_skipped_blocks;
+                totalBlocks = xqaParams.skip_softmax_total_blocks;
+#endif // defined(SKIP_SOFTMAX_STAT)
+                int const status = getTemporalXqaFn()(xqaQInputPtr, kvCacheBuffer.mPrimaryPoolPtr,
+                    kvCacheBuffer.mPrimaryPoolPtr, launchParams.output,
+                    reinterpret_cast<int32_t const*>(kvCacheBuffer.data),
+                    reinterpret_cast<uint32_t const*>(xqaParams.sequence_lengths), maxSequenceLength,
+                    static_cast<uint32_t>(numKVHeads), xqaParams.skip_softmax_threshold_scale_factor,
+                    launchParams.kv_scale_quant_orig, skippedBlocks, totalBlocks,
+                    static_cast<uint32_t>(xqaParams.layer_idx),
+                    getTemporalEpsilon(static_cast<uint32_t>(xqaParams.layer_idx)), getTemporalRefreshInterval(),
+                    reinterpret_cast<uint32_t*>(launchParams.semaphores), launchParams.scratch,
+                    reinterpret_cast<void*>(stream));
+                TLLM_CHECK_WITH_INFO(status == 0, "temporal XQA launch failed with code %d", status);
+                sync_check_cuda_error(stream);
+                return;
+            }
+            else
+            {
+                TLLM_THROW("temporal QK skip requires BF16 paged KV cache");
+            }
+        }
         appendParam(&launchParams.num_k_heads);
         bool const allowSlidingWindow
             = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
