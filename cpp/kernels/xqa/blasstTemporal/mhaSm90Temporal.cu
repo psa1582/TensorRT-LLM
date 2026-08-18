@@ -2139,6 +2139,22 @@ CUBIN_EXPORT __global__
                     = (packed >> temporalRefreshAgeShift) & temporalRefreshAgeMask;
                 bool const candidate = tileState != nullptr && runCount >= temporalK;
                 bool const preSkip = candidate && refreshAge < temporalRefreshInterval;
+#if SKIP_SOFTMAX_ATTN_BLOCK_STATS && TEMPORAL_PIPELINE_MODE >= 10
+                // Modes 10--15 decide the mask in this producer warp and bypass the consumer-side counters.
+                if (candidate && temporalCandidateCount != nullptr)
+                {
+                    atomicAdd(temporalCandidateCount, 1U);
+                }
+                if (preSkip && temporalElidedCount != nullptr)
+                {
+                    atomicAdd(temporalElidedCount, 1U);
+                }
+                if (candidate && !preSkip && refreshAge >= temporalRefreshInterval
+                    && temporalRefreshCount != nullptr)
+                {
+                    atomicAdd(temporalRefreshCount, 1U);
+                }
+#endif
                 smem.temporalControl[idxIter]
                     = (packed & temporalPackedStateMask) | (static_cast<uint32_t>(preSkip) << 31U);
 #if TEMPORAL_PIPELINE_MODE == 12 || TEMPORAL_PIPELINE_MODE == 13 || TEMPORAL_PIPELINE_MODE == 14 \

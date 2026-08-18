@@ -18,6 +18,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#if defined(BLASST_TEMPORAL_TESTING)
+#include <vector>
+#endif
 
 #include <cuda_runtime.h>
 #include "mhaTemporal.h"
@@ -31,6 +34,7 @@ uint32_t gMaxBatch = 0;
 uint32_t gMaxHeads = 0;
 uint32_t gMaxTiles = 0;
 cudaDeviceProp gDeviceProps{};
+constexpr uint32_t kTemporalProtectedLayers = 2;
 constexpr uint32_t kMaxTimingEvents = 5000;
 cudaEvent_t gTimingStart[kMaxTimingEvents]{};
 cudaEvent_t gTimingStop[kMaxTimingEvents]{};
@@ -192,6 +196,58 @@ extern "C" int blasst_temporal_reset(void* stream_ptr)
     return status == cudaSuccess ? 0 : static_cast<int>(status);
 }
 
+#if defined(BLASST_TEMPORAL_TESTING)
+extern "C" int blasst_temporal_test_set_null_state(int enabled)
+{
+    gNullTemporalState = enabled != 0;
+    return 0;
+}
+
+extern "C" int blasst_temporal_test_fill_layer_state(uint32_t layer_idx, uint32_t packed, void* stream_ptr)
+{
+    if (gTemporalState == nullptr || layer_idx >= gMaxLayers)
+    {
+        return -1;
+    }
+    uint64_t const entries = static_cast<uint64_t>(gMaxBatch) * gMaxHeads * gMaxTiles;
+    std::vector<TemporalQkState> values(entries, TemporalQkState{packed});
+    TemporalQkState* const layer_state = gTemporalState + layer_idx * entries;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaError_t status
+        = cudaMemcpyAsync(layer_state, values.data(), entries * sizeof(TemporalQkState), cudaMemcpyHostToDevice, stream);
+    if (status == cudaSuccess)
+    {
+        status = cudaStreamSynchronize(stream);
+    }
+    return status == cudaSuccess ? 0 : static_cast<int>(status);
+}
+
+extern "C" int blasst_temporal_test_count_layer_state_mismatches(
+    uint32_t layer_idx, uint32_t expected_packed, uint32_t* mismatches)
+{
+    if (gTemporalState == nullptr || layer_idx >= gMaxLayers || mismatches == nullptr)
+    {
+        return -1;
+    }
+    uint64_t const entries = static_cast<uint64_t>(gMaxBatch) * gMaxHeads * gMaxTiles;
+    std::vector<TemporalQkState> values(entries);
+    TemporalQkState const* const layer_state = gTemporalState + layer_idx * entries;
+    cudaError_t const status
+        = cudaMemcpy(values.data(), layer_state, entries * sizeof(TemporalQkState), cudaMemcpyDeviceToHost);
+    if (status != cudaSuccess)
+    {
+        return static_cast<int>(status);
+    }
+    uint32_t mismatch_count = 0;
+    for (TemporalQkState const& value : values)
+    {
+        mismatch_count += value.packed != expected_packed;
+    }
+    *mismatches = mismatch_count;
+    return 0;
+}
+#endif
+
 extern "C" int blasst_temporal_get_stats(
     uint32_t* candidates, uint32_t* elided, uint32_t* refreshes)
 {
@@ -285,6 +341,9 @@ extern "C" int blasst_xqa_bf16_temporal(
     {
         uint32_t const effective_refresh_interval
             = gTemporalPolicyOverride ? gTemporalRefreshInterval : temporal_refresh_interval;
+        bool const protectLayerFromTemporalQkSkip = layer_idx < kTemporalProtectedLayers;
+        TemporalQkState* const effectiveTemporalState
+            = (gNullTemporalState || protectLayerFromTemporalQkSkip) ? nullptr : gTemporalState;
         launchHopperF8MHA(
             gDeviceProps,
             num_kv_heads,
@@ -301,7 +360,7 @@ extern "C" int blasst_xqa_bf16_temporal(
             skip_softmax_threshold_scale_factor,
             gStatsEnabled ? (skipped_blocks != nullptr ? skipped_blocks : gTemporalCounters + 3) : nullptr,
             gStatsEnabled ? (total_blocks != nullptr ? total_blocks : gTemporalCounters + 4) : nullptr,
-            gNullTemporalState ? nullptr : gTemporalState,
+            effectiveTemporalState,
             gMaxTiles,
             gMaxHeads,
             gMaxBatch,

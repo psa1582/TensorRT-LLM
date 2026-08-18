@@ -55,6 +55,14 @@ The runner loads the library once and applies `TLLM_TEMPORAL_K` and `TLLM_TEMPOR
 `blasst_temporal_set_policy`. Per-layer thresholds come from `TLLM_TEMPORAL_EPSILONS`; `TLLM_TEMPORAL_EPSILON` is the
 fallback for layers not present in the list.
 
+Transformer layers 0 and 1 always execute Full-QK with respect to temporal pre-skipping. Their temporal state is not
+read or updated, including when a state slot was populated by an earlier launch. Stock BLASST PV-side skipping may
+still apply in those layers. `TLLM_TEMPORAL_EPSILONS` remains zero-based and indexed by the full transformer layer
+number: values at indices 0 and 1 are ignored, and layer 2 continues to use index 2.
+
+For a 32-layer model, calibration fits epsilon only for layers 2--31. Whole-model actual-QK reduction must still use
+all layer work units, including the Full-QK work from layers 0 and 1, in its denominator.
+
 Allocate state once before generation and reset it between independent sequences:
 
 ```python
@@ -90,3 +98,13 @@ python tools/blasst/test_runtime_policy_state.py
 ```
 
 The CUDA library and TensorRT-LLM route must be compiled and exercised on an H100 before performance claims are made.
+The protected-layer regression uses test-only state seeding to prove that stale candidate state cannot enable L0/L1
+pre-skipping:
+
+```bash
+BLASST_TEMPORAL_TESTING=1 \
+  OUTPUT_LIBRARY="$PWD/build/blasstTemporal/libblasst_xqa_temporal_test_page64.so" \
+  bash tools/blasst/buildTemporalXqa.sh
+python tools/blasst/test_temporal_layer_protection.py \
+  build/blasstTemporal/libblasst_xqa_temporal_test_page64.so
+```

@@ -13,6 +13,10 @@ KEEP="$BUILD/keepPipeline14Chunk16"
 OUT="${OUTPUT_LIBRARY:-$BUILD/libblasst_xqa_temporal_page64.so}"
 CUDA_ROOT="${CUDA_HOME:-/usr/local/cuda}"
 NVCC="${NVCC:-$CUDA_ROOT/bin/nvcc}"
+TEST_DEFINES=()
+if [[ "${BLASST_TEMPORAL_TESTING:-0}" == "1" ]]; then
+  TEST_DEFINES+=(-DBLASST_TEMPORAL_TESTING=1)
+fi
 
 mkdir -p "$KEEP" "$(dirname -- "$OUT")"
 "$NVCC" \
@@ -23,6 +27,7 @@ mkdir -p "$KEEP" "$(dirname -- "$OUT")"
   -DTOKENS_PER_PAGE=64 -DPAGED_KV_CACHE_LAYOUT=0 \
   -DSKIP_SOFTMAX_ATTN=1 -DSKIP_SOFTMAX_ATTN_BLOCK_STATS=1 -DPRE_QK_SKIP=0 -DTEMPORAL_QK_SKIP=1 \
   -DTEMPORAL_PIPELINE_MODE=14 -DTEMPORAL_CHUNK_ITERS=16 -DENABLE_PDL=2 \
+  "${TEST_DEFINES[@]}" \
   "$TEMPORAL_SRC/mhaSm90Temporal.cu" "$SRC/tensorMap.cpp" "$TEMPORAL_SRC/temporalXqaApi.cpp" \
   -I"$TEMPORAL_SRC" -I"$SRC" -L"$CUDA_ROOT/lib64" -lcudart -lcuda \
   -o "$OUT"
