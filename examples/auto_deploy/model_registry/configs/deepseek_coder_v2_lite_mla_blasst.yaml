@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# H100 single-GPU baseline for deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct.
+# This base config keeps RoPE outside the MLA kernel. Set the BLASST threshold
+# in the process environment before launch; unset or zero means dense attention.
+runtime: trtllm
+world_size: 1
+compile_backend: torch-simple
+attn_backend: trtllm
+dtype: bfloat16
+max_batch_size: 1
+max_seq_len: 65536
+max_num_tokens: 65536
+enable_chunked_prefill: false
+disable_overlap_scheduler: true
+cuda_graph_config: null
+kv_cache_config:
+  max_tokens: 66048
+  free_gpu_memory_fraction: 0.5
+  enable_block_reuse: false
+  tokens_per_block: 32
+transforms:
+  insert_cached_mla_attention:
+    backend: trtllm_mla
+  fuse_rope_into_trtllm_mla:
+    enabled: false
+  detect_sharding:
+    enable_attention_dp: true

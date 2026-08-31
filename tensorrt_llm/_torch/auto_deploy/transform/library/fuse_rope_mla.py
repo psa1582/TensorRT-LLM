@@ -307,9 +307,11 @@ def _undo_rope_deinterleave(
     permutation so projected data arrives in GPTJ layout at runtime,
     eliminating the need for a per-step runtime permutation.
 
-    Handles tensor-parallel (TP) column sharding on dim-0.  With TP,
-    ``q_b_proj`` is split by heads and ``kv_a_proj_with_mqa`` is evenly
-    split so its PE rows may only reside on a subset of ranks.
+    Handles both ``q_b_proj`` and the direct ``q_proj`` used when
+    ``q_lora_rank`` is None. Handles tensor-parallel (TP) column sharding on
+    dim-0. With TP, Q projections are split by heads and
+    ``kv_a_proj_with_mqa`` is evenly split so its PE rows may only reside on a
+    subset of ranks.
 
     Returns the number of weight tensors modified.
     """
@@ -342,7 +344,7 @@ def _undo_rope_deinterleave(
 
     count = 0
     for name, param in gm.named_parameters():
-        if name.endswith("q_b_proj.weight"):
+        if name.endswith(("q_b_proj.weight", "q_proj.weight")):
             # Derive local head count from actual weight shape; TP column-shards
             # dim-0 so the local shape is [num_heads_local * qk_head_dim, ...].
             num_heads_local = param.data.shape[0] // qk_head_dim
@@ -507,7 +509,9 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         for mla_node in rewired_mla_nodes:
             mla_node.meta[_TRTLLM_MLA_ROPE_INFO_KEY] = {
                 "cos_sin_tensor": rotary_cos_sin,
-                "is_neox": True,
+                # mla_rope_generation consumes adjacent GPTJ pairs. The model
+                # weights are restored to that layout immediately below.
+                "is_neox": False,
             }
 
         graph.eliminate_dead_code()

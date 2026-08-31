@@ -81,6 +81,43 @@ decode step.
 Use `tokens_per_block=64` for all three modes. The temporal route rejects unsupported shapes instead of silently
 falling back, so an invalid benchmark configuration cannot be mistaken for a temporal result.
 
+## MLA experiments on H100
+
+AutoDeploy's `trtllm_mla` backend exposes the Stock BLASST skip-softmax threshold through two opt-in environment
+variables. Set them before starting Python because the values are read when the MLA backend module is imported:
+
+```bash
+export TRTLLM_BLASST_PREFILL_THRESHOLD=3
+export TRTLLM_BLASST_DECODE_THRESHOLD=0
+```
+
+An unset, empty, zero, or negative value disables that threshold and is the dense baseline. Positive values are
+forwarded to every MLA `thop.attention` call as `skip_softmax_threshold_scale_factor_prefill` or
+`skip_softmax_threshold_scale_factor_decode`. Calibrate the prefill threshold against accuracy data rather than
+assuming that a value transfers between models or context lengths.
+
+Two model-registry configurations are provided for `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` on one H100:
+
+```bash
+# RoPE remains in the model graph; the MLA kernel receives an identity table.
+python examples/auto_deploy/build_and_run_ad.py \
+  --model deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
+  --use-registry --registry-config-id mla_blasst_nofuse_h100
+
+# RoPE is moved into the TRT-LLM MLA kernel.
+python examples/auto_deploy/build_and_run_ad.py \
+  --model deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct \
+  --use-registry --registry-config-id mla_blasst_fused_h100
+```
+
+The no-fuse path sizes its identity RoPE table from `max_seq_len`; a 64K run no longer reuses the fallback 8K table.
+The fused path restores both `q_b_proj` and the direct `q_proj` used by models with `q_lora_rank=None` to GPTJ
+pairwise layout before `mla_rope_generation` applies RoPE.
+
+The temporal pre-QK decode library in this directory is a separate optimization with the shape restrictions listed
+above. DeepSeek-Coder-V2-Lite's MLA dimensions (`QK=192`, `V=128`) do not satisfy that temporal XQA contract. Do not
+set `TLLM_TEMPORAL_QK_SKIP=1` for this MLA experiment; use the Stock BLASST threshold variables instead.
+
 ## Validation
 
 The packed state-machine contract is CPU-only and can be run anywhere:

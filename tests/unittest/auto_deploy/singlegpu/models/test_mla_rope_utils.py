@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import _TrtllmMLAPlanner
 from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
     _rope_deinterleave_load_hook,
 )
@@ -14,13 +16,16 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek import (
 )
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v2 import (
     DeepSeekV2YarnRotaryEmbedding,
+    _q_proj_deinterleave_hook,
 )
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_glm4_moe_lite import (
     Glm4MoeLiteYarnRotaryEmbedding,
 )
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_kimi_k2 import KimiK2YarnRotaryEmbedding
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rope_mla import (
     _compute_rotary_cos_sin_from_config,
+    _undo_rope_deinterleave,
 )
 
 
@@ -34,6 +39,17 @@ class _Factory:
 
     def _get_model_config(self):
         return self.config, None
+
+
+class _DirectQProjModel(nn.Module):
+    """Minimal DeepSeek-V2 parameter hierarchy for direct-Q RoPE tests."""
+
+    def __init__(self, hidden_size: int, q_out_features: int):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        self.model.layers[0].self_attn = nn.Module()
+        self.model.layers[0].self_attn.q_proj = nn.Linear(hidden_size, q_out_features, bias=False)
 
 
 @pytest.mark.parametrize(
@@ -154,6 +170,71 @@ def test_rope_deinterleave_load_hook_reorders_q_and_kv_weights(dtype):
         state_dict["model.layers.0.self_attn.kv_a_proj_with_mqa.bias"].float(),
         kv_bias_expected,
     )
+
+
+def test_fused_mla_restores_direct_q_proj_to_gptj_layout():
+    """DeepSeek-Coder-V2-Lite uses q_proj because q_lora_rank is None."""
+    num_heads = 2
+    qk_nope_head_dim = 2
+    qk_rope_head_dim = 4
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    hidden_size = 3
+    original = torch.arange(num_heads * qk_head_dim * hidden_size, dtype=torch.float32).reshape(
+        num_heads * qk_head_dim, hidden_size
+    )
+
+    state_dict = {"model.layers.0.self_attn.q_proj.weight": original.clone()}
+    _q_proj_deinterleave_hook(
+        state_dict,
+        prefix="",
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        num_heads=num_heads,
+        num_layers=1,
+    )
+
+    model = _DirectQProjModel(hidden_size, num_heads * qk_head_dim)
+    model.load_state_dict(state_dict)
+    config = SimpleNamespace(
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=2,
+        num_attention_heads=num_heads,
+    )
+
+    modified = _undo_rope_deinterleave(
+        model,
+        _Factory(config),
+        SharedConfig(local_rank=0, world_size=1),
+    )
+
+    assert modified == 1
+    torch.testing.assert_close(model.model.layers[0].self_attn.q_proj.weight, original)
+
+
+def test_no_fuse_mla_identity_rope_covers_configured_context(monkeypatch):
+    qk_rope_head_dim = 4
+    max_seq_len = 65536
+
+    def _fake_rope_params(_self):
+        inv_freq = torch.ones(qk_rope_head_dim // 2)
+        fallback = torch.zeros(1, 8192 * qk_rope_head_dim * 2)
+        return inv_freq, fallback
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla."
+        "RopeParams.create_rope_const_params",
+        _fake_rope_params,
+    )
+    planner = _TrtllmMLAPlanner()
+
+    planner.ensure_rope_tables(qk_rope_head_dim, max_seq_len)
+
+    assert planner._identity_rope_positions == max_seq_len
+    assert planner.identity_cos_sin is not None
+    identity = planner.identity_cos_sin.view(max_seq_len, qk_rope_head_dim, 2)
+    torch.testing.assert_close(identity[..., 0], torch.ones_like(identity[..., 0]))
+    torch.testing.assert_close(identity[..., 1], torch.zeros_like(identity[..., 1]))
 
 
 @pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="requires float8 support")
