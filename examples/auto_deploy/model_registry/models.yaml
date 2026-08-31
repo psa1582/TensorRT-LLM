@@ -763,6 +763,12 @@ models:
 - name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
   config_id: deepseek_v2_ep
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'deepseek_v2_ep.yaml']
+- name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+  config_id: mla_blasst_nofuse_h100
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'deepseek_coder_v2_lite_mla_blasst.yaml']
+- name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+  config_id: mla_blasst_fused_h100
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'deepseek_coder_v2_lite_mla_blasst.yaml', 'mla_fused_rope.yaml']
 # --- Seed-Coder reasoning (2025) ---
 - name: ByteDance-Seed/Seed-Coder-8B-Reasoning
   config_id: default_ws_2

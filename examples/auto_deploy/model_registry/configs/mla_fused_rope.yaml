@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Compose after an MLA model config to move RoPE into the TRT-LLM MLA kernel.
+transforms:
+  fuse_rope_into_trtllm_mla:
+    enabled: true

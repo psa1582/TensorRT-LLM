@@ -53,6 +53,7 @@ Cache layout:
 """
 
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -90,6 +91,24 @@ from .rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+def _optional_positive_float_from_env(name: str) -> Optional[float]:
+    """Read an opt-in BLASST threshold from the process environment."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or raw_value.strip() == "":
+        return None
+    value = float(raw_value)
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {raw_value!r}")
+    return value if value > 0.0 else None
+
+
+# AutoDeploy's TRT-LLM MLA path does not currently plumb LlmArgs'
+# SkipSoftmaxAttentionConfig into thop.attention. Keep this experiment opt-in
+# and process-scoped so an unset, zero, or negative value remains dense.
+_BLASST_PREFILL_THRESHOLD = _optional_positive_float_from_env("TRTLLM_BLASST_PREFILL_THRESHOLD")
+_BLASST_DECODE_THRESHOLD = _optional_positive_float_from_env("TRTLLM_BLASST_DECODE_THRESHOLD")
 
 # ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
 # auto-resizes the workspace tensor when its sizing formula exceeds the
@@ -229,6 +248,8 @@ class _TrtllmMLAPlanner:
         self.rotary_cos_sin: Optional[torch.Tensor] = None
         self.identity_cos_sin: Optional[torch.Tensor] = None
         self._rope_initialized: bool = False
+        self._identity_rope_positions: int = 0
+        self._rope_dim: int = 0
 
         # Decode-path buffers reused across layers (allocated on first use)
         self.cu_q_decode: Optional[torch.Tensor] = None
@@ -709,7 +730,7 @@ class _TrtllmMLAPlanner:
         k_slice.mul_(block_offset_multiplier)
         self.block_offsets[0, :num_seq, 1, :] = k_slice
 
-    def ensure_rope_tables(self, qk_rope_head_dim: int):
+    def ensure_rope_tables(self, qk_rope_head_dim: int, max_seq_len: int):
         """Create RoPE inv_freq + cos_sin tables (once, reused across calls).
 
         This is only the fall-back table used when the fused-RoPE transform has
@@ -717,19 +738,41 @@ class _TrtllmMLAPlanner:
         the decode no-fuse path we also build a matching identity table so
         ``mla_rope_generation`` becomes a no-op on pre-RoPE'd q_pe / kpe.
         """
-        if self._rope_initialized:
+        if self._rope_initialized and self._rope_dim != qk_rope_head_dim:
+            raise RuntimeError(
+                "TRT-LLM MLA planner cannot reuse RoPE tables with a different dimension: "
+                f"initialized={self._rope_dim}, requested={qk_rope_head_dim}"
+            )
+
+        if not self._rope_initialized:
+            rope = RopeParams(
+                dim=qk_rope_head_dim,
+                theta=10000.0,
+                max_positions=8192,
+                original_max_positions=4096,
+            )
+            self.rotary_inv_freq, self.rotary_cos_sin = rope.create_rope_const_params()
+            self._rope_initialized = True
+            self._rope_dim = qk_rope_head_dim
+
+        # The fallback rotary table may be sized to the model's original YaRN
+        # context (often 4096 or 8192). In no-fuse mode it is not used for
+        # rotation: q_pe/kpe already contain RoPE and the decode kernel receives
+        # this identity table. Allocate it independently for the full configured
+        # sequence length so long-context positions cannot read out of bounds.
+        identity_positions = max(8192, max_seq_len)
+        if self._identity_rope_positions >= identity_positions:
             return
-        rope = RopeParams(
-            dim=qk_rope_head_dim,
-            theta=10000.0,
-            max_positions=8192,
-            original_max_positions=4096,
+        assert self.rotary_cos_sin is not None
+        identity = torch.zeros(
+            1,
+            identity_positions * qk_rope_head_dim * 2,
+            dtype=self.rotary_cos_sin.dtype,
+            device=self.rotary_cos_sin.device,
         )
-        self.rotary_inv_freq, self.rotary_cos_sin = rope.create_rope_const_params()
-        identity = torch.zeros_like(self.rotary_cos_sin)
         identity.view(-1, qk_rope_head_dim, 2)[:, :, 0] = 1.0
         self.identity_cos_sin = identity
-        self._rope_initialized = True
+        self._identity_rope_positions = identity_positions
 
     def get_pool_pointers_for_layer(self, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return a per-layer ``host_pool_pointers`` tensor for this kv_cache view."""
@@ -1089,8 +1132,8 @@ def _handle_prefill_thop(
         1,  # sparse_attn_indices_block_size
         0,  # num_sparse_topk
         None,  # sparse_attn_kv_lens
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
+        _BLASST_PREFILL_THRESHOLD,  # skip_softmax_threshold_scale_factor_prefill
+        _BLASST_DECODE_THRESHOLD,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
         None,  # cu_q_seqlens
         None,  # cu_kv_seqlens
@@ -1382,8 +1425,8 @@ def _handle_prefill_thop_cached_kv(
             1,  # sparse_attn_indices_block_size
             0,  # num_sparse_topk
             None,  # sparse_attn_kv_lens
-            None,  # skip_softmax_threshold_scale_factor_prefill
-            None,  # skip_softmax_threshold_scale_factor_decode
+            _BLASST_PREFILL_THRESHOLD,  # skip_softmax_threshold_scale_factor_prefill
+            _BLASST_DECODE_THRESHOLD,  # skip_softmax_threshold_scale_factor_decode
             None,  # skip_softmax_stat
             None,  # cu_q_seqlens
             None,  # cu_kv_seqlens
@@ -1512,8 +1555,8 @@ def _handle_prefill_thop_cached_kv(
         1,  # sparse_attn_indices_block_size
         0,  # num_sparse_topk
         None,  # sparse_attn_kv_lens
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
+        _BLASST_PREFILL_THRESHOLD,  # skip_softmax_threshold_scale_factor_prefill
+        _BLASST_DECODE_THRESHOLD,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
         None,  # cu_q_seqlens
         None,  # cu_kv_seqlens
@@ -1779,8 +1822,8 @@ def _handle_decode_impl(
         1,  # sparse_attn_indices_block_size
         0,  # num_sparse_topk
         None,  # sparse_attn_kv_lens
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
+        _BLASST_PREFILL_THRESHOLD,  # skip_softmax_threshold_scale_factor_prefill
+        _BLASST_DECODE_THRESHOLD,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
         cu_q,  # cu_q_seqlens
         cu_kv,  # cu_kv_seqlens
@@ -1898,7 +1941,7 @@ def _mla_with_cache_impl(
 
     # Create RoPE tables (+ identity fallback) once per planner; consumed by
     # the decode/prefill helpers and referenced in the thop.attention calls.
-    planner.ensure_rope_tables(qk_rope_head_dim)
+    planner.ensure_rope_tables(qk_rope_head_dim, max_seq_len)
 
     if num_decode > 0:
         planner.ensure_decode_buffers(
